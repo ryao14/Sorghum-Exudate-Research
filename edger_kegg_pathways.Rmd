@@ -1,0 +1,151 @@
+library(data.table)   # Also requires R.utils to read gz and bz2 files
+library(phyloseq)
+library(ALDEx2)
+library(tidyverse)
+library(ggpicrust2)
+library(ggplot2)
+library(ggh4x)
+library(ggprism)
+library(vegan)
+library(tibble)
+library(edgeR)
+library(KEGGREST)
+
+#if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+
+#BiocManager::install("KEGGREST")
+
+# Import data files
+p2_KEGG_table <- ko2kegg_abundance("/Users/ryany/Downloads/picrust2_out/picrust2_out/KO_metagenome_out/pred_metagenome_unstrat_cleaned.tsv")
+p2_KEGG_table_t <- base::t(p2_KEGG_table)
+p2_KEGG_table_t <- as.data.frame(p2_KEGG_table_t)
+write_tsv(p2_KEGG_table_t, "/Users/ryany/Downloads/picrust2_out/picrust2_out/KO_metagenome_out/pred_metagenome_unstrat.tsv/kegg_table.tsv")
+
+p2_2024_sequencing_metadata <- read.csv(file="/Users/ryany/Downloads/metadata.csv")
+sequencing_metadata_2024 <- read_tsv("C:/Users/ryany/Downloads/15207_20250224-075556 (1).txt")
+sequencing_metadata_2024 <- as.data.frame(sequencing_metadata_2024)
+rownames(sequencing_metadata_2024) <- sequencing_metadata_2024$sample_name
+sequencing_metadata_2024 <- sequencing_metadata_2024[order(rownames(sequencing_metadata_2024)), ]  
+p2_KEGG_table_t <- p2_KEGG_table_t[order(rownames(p2_KEGG_table_t)), ]  
+
+kegg_otu = otu_table(p2_KEGG_table_t, taxa_are_rows = FALSE)
+
+rownames(p2_KEGG_table_t) <- as.character(p2_2024_sequencing_metadata$sample_name)
+rownames(p2_2024_sequencing_metadata) <- p2_2024_sequencing_metadata$X
+samp.names <- as.character(p2_2024_sequencing_metadata$sample_name)
+sample_names(p2_KEGG_table_t) <- samp.names
+sample_names(p2_2024_sequencing_metadata) <- samp.names
+
+# Phyloseq to edgeR function
+phyloseq_to_edgeR = function(physeq, group, method="RLE", ...){
+  require("edgeR")
+  require("phyloseq")
+  if( !taxa_are_rows(physeq) ){ physeq <- t(physeq) }
+  x = as(otu_table(physeq), "matrix")
+  x = x + 1
+  if( identical(all.equal(length(group), 1), TRUE) & nsamples(physeq) > 1 ){
+    group = get_variable(physeq, group)
+  }
+  taxonomy = tax_table(physeq, errorIfNULL=FALSE)
+  if( !is.null(taxonomy) ){
+    taxonomy = data.frame(as(taxonomy, "matrix"))
+  } 
+  y = DGEList(counts=x, group=group, genes=taxonomy, remove.zeros = TRUE, ...)
+  z = calcNormFactors(y, method=method)
+  if( !all(is.finite(z$samples$norm.factors)) ){
+    stop("Something wrong with edgeR::calcNormFactors on this data, non-finite $norm.factors, consider changing `method` argument")
+  }
+  return(estimateTagwiseDisp(estimateCommonDisp(z)))
+}
+
+# edgeR on pathways
+p2_diff <- phyloseq(otu_table(p2_KEGG_table_t, taxa_are_rows = FALSE), sample_data(sequencing_metadata_2024))
+print(p2_diff)
+
+p2_diff <- subset_samples(p2_diff, (sample_type == "endosphere" | sample_type == "rhizosphere"))
+
+p2_diff_trans = transform_sample_counts(p2_diff, function(x) {x/sum(x)})
+hist(log10(apply(otu_table(p2_diff_trans), 2, var)), 
+     xlab = "log10(variance)", breaks = 50)
+
+cat("Number of OTUs kept by variance:", length(keepOTUs), "\n")
+
+dge_kegg = phyloseq_to_edgeR(p2_diff, group="sample_type")
+
+et_kegg = exactTest(dge_kegg)
+tt_kegg = topTags(et_kegg, n=nrow(dge_kegg$table), adjust.method="BH", sort.by="PValue")
+res_kegg = tt_kegg@.Data[[1]]
+alpha = 0.05
+sigtab_kegg = res_kegg[(res_kegg$FDR < alpha), ]
+
+sigtab_kegg <- sigtab_kegg %>% mutate(group1 = "rhizosphere")
+sigtab_kegg <- sigtab_kegg %>% mutate(group2 = "endosphere")
+sigtab_kegg <- sigtab_kegg %>% mutate(method = "edgeR")
+sigtab_kegg <- sigtab_kegg %>% mutate(adj_method = "BH")
+colnames(sigtab_kegg)[3] <- "p_value"
+colnames(sigtab_kegg)[4] <- "p_adjust"
+
+sigtab_kegg <- tibble::rownames_to_column(sigtab_kegg, "feature")
+
+Final_KOtoKEGGwAnnos2 <- pathway_annotation(pathway = "KO", daa_results_df = sigtab_kegg, ko_to_kegg = TRUE)
+cat("Original dimensions:", dim(Final_KOtoKEGGwAnnos2), "\n")
+
+Final_KOtoKEGGwAnnos <- Final_KOtoKEGGwAnnos2
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+  scale_fill_brewer(palette = palname, ...)
+}
+
+x = tapply(Final_KOtoKEGGwAnnos$logFC, Final_KOtoKEGGwAnnos$pathway_name, function(x) max(x))
+x = sort(x, TRUE)
+Final_KOtoKEGGwAnnos$pathway_name = factor(as.character(Final_KOtoKEGGwAnnos$pathway_name), levels = names(x))
+
+Final_KOtoKEGGwAnnos$pathway_description <- with(Final_KOtoKEGGwAnnos, factor(pathway_description, levels = unique(pathway_description[order(pathway_class)])))
+
+pathwaycl_cols <- c(
+  "Phosphotransferase system (PTS)" = "#1B9E77",
+  "Thiamine metabolism" = "#D95F02",
+  "Lipopolysaccharide biosynthesis" = "#7570B3",
+  "Nitrotoluene degradation" = "#E6AB02"
+)
+
+# Load stringr if not already loaded with tidyverse
+library(stringr)
+
+# Wrap pathway_class values
+Final_KOtoKEGGwAnnos$pathway_class_wrapped <- str_wrap(Final_KOtoKEGGwAnnos$pathway_class, width = 15)
+
+p <- ggplot(data = Final_KOtoKEGGwAnnos, aes(x = logFC, y = pathway_class_wrapped)) + 
+  geom_point(aes(fill = pathway_name), stroke = 1, size = 3.50, alpha = 1, shape = 21) + 
+  geom_vline(xintercept = c(0, 0, 0, 0), linetype = "dashed", colour = "black", size = 0.5) + 
+  theme_bw() + 
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.key = element_rect(fill = "transparent", color = NA),
+    panel.grid.major = element_line(color = "gray70", linetype = "dashed", size = 0.3),  # Darker major grid
+    panel.grid.minor = element_line(color = "gray80", linetype = "dotted", size = 0.1),  # Darker minor grid
+    text = element_text(family = "Times New Roman", color = "black"),
+    axis.title = element_text(size = 20, color = "black"),
+    axis.text = element_text(size = 16, color = "black"),
+    legend.title = element_text(size = 20, color = "black"),
+    legend.text = element_text(size = 16, color = "black"),
+    axis.text.x = element_text(hjust = 0, vjust = 0.5, color = "black")
+  ) + 
+  labs(x = "Log Fold Change", y = "Pathway Class") + 
+  scale_y_discrete(expand = expansion(add = c(0.6, 0.6))) +  # Maintain top/bottom margins
+  scale_fill_manual(values = pathwaycl_cols) + 
+  guides(fill = guide_legend(title = "Pathway Name"))
+ggsave(
+  "endosphere_vs_rhizosphere_plot.tiff",
+  plot = p,
+  width = 12,
+  height = 7,  # Reduced from 10 to 7 inches to compress vertically
+  dpi = 300,
+  device = "tiff",
+  compression = "lzw",
+  bg = "transparent"
+)

@@ -1,0 +1,54 @@
+
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+
+# Set working directory
+setwd("C:/Users/ryany/Downloads/picrust2_out/picrust2_out/pathways_out/path_abun_unstrat.tsv")
+
+# Load PICRUSt2 pathway abundance table
+path_abun <- read.delim("path_abun_unstrat.tsv", row.names = 1, check.names = FALSE)
+path_abun <- as.data.frame(t(path_abun))  # Transpose to samples as rows, pathways as columns
+
+# Load metadata
+metadata <- read.csv("C:/Users/ryany/Downloads/metadata.csv", row.names = 1)
+metadata <- as.data.frame(metadata)
+
+# Print available metadata columns for debugging
+cat("Available metadata columns:", colnames(metadata), "\n")
+
+# Ensure sample names match between abundance table and metadata
+common_samples <- intersect(rownames(path_abun), rownames(metadata))
+path_abun <- path_abun[common_samples, ]
+metadata <- metadata[common_samples, ]
+
+# Create phyloseq object
+otu_table <- otu_table(path_abun, taxa_are_rows = FALSE)
+sample_data <- sample_data(metadata)
+physeq <- phyloseq(otu_table, sample_data)
+
+# Compute Bray-Curtis distance
+dist_matrix <- phyloseq::distance(physeq, method = "bray")
+
+# Perform PCoA
+pcoa <- cmdscale(dist_matrix, k = 2, eig = TRUE)
+pcoa_df <- data.frame(SampleID = rownames(pcoa$points), PC1 = pcoa$points[,1], PC2 = pcoa$points[,2])
+pcoa_df <- merge(pcoa_df, metadata, by.x = "SampleID", by.y = "row.names")
+
+# Categorize samples by the last digit (e.g., .1, .2, .3) as Plant 1, Plant 2, Plant 3
+pcoa_df$Plant_Group <- factor(substr(pcoa_df$SampleID, nchar(pcoa_df$SampleID), nchar(pcoa_df$SampleID)),
+                              levels = c("1", "2", "3"),
+                              labels = c("Plant 1", "Plant 2", "Plant 3"))
+
+# Visualize PCoA
+p <- ggplot(pcoa_df, aes(x = PC1, y = PC2, color = sample_type, shape = Plant_Group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCoA of PICRUSt2 Predicted Pathways", x = "PC1", y = "PC2", color = "Sample Type", shape = "Plant Group") +
+  theme(legend.position = "right")
+
+# Save plot as PNG
+ggsave("pcoa_picrust2_pathways.png", p, width = 8, height = 6, dpi = 300)
+
+# Optional: Save PCoA results
+write.csv(pcoa_df, "pcoa_results.csv", row.names = FALSE)
